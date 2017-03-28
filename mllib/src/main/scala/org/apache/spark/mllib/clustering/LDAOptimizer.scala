@@ -161,12 +161,15 @@ final class EMLDAOptimizer extends LDAOptimizer {
         val vertices: VertexRDD[TopicCounts] = model.graph.vertices
         val edgesUnion: RDD[Edge[TokenCount]] = model.graph.edges.union(edges)
         Graph(vertices, edgesUnion)
+
+        //TODO init vertices, doc side
+
       case None =>
         // Create vertices.
         // Initially, we use random soft assignments of tokens to topics (random gamma).
-        val docTermVertices: RDD[(VertexId, TopicCounts)] =
-          initRandomTermVertices(edges, lda.getK, lda.getSeed)
-        Graph(docTermVertices, edges)
+        val vertices = initRandomDocTermVertices(edges, lda.getK, lda.getSeed)
+        Graph(vertices, edges)
+
       case other =>
         throw new IllegalArgumentException(s"mismatched model types, got $other")
     }
@@ -181,7 +184,7 @@ final class EMLDAOptimizer extends LDAOptimizer {
     this
   }
 
-  private def initRandomTermVertices(edges: RDD[Edge[TokenCount]], k: Int, randomSeed: Long) = {
+  private def initRandomDocTermVertices(edges: RDD[Edge[TokenCount]], k: Int, randomSeed: Long) = {
     // Create vertices.
     // Initially, we use random soft assignments of tokens to topics (random gamma).
     val docTermVertices: RDD[(VertexId, TopicCounts)] = {

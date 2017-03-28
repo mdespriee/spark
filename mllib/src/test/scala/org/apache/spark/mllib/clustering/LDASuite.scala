@@ -166,6 +166,105 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
     }
   }
 
+  test("incremental EMLDAModel") {
+    val k = 3
+    val topicSmoothing = 1.2
+    val termSmoothing = 1.2
+
+    // Train a model
+    val lda0 = new LDA().setK(k)
+      .setOptimizer(new EMLDAOptimizer)
+      .setDocConcentration(topicSmoothing)
+      .setTopicConcentration(termSmoothing)
+      .setMaxIterations(5)
+      .setSeed(12345)
+    val corpus0 = sc.parallelize(tinyCorpus.take(3), 2)
+    val model0 = lda0.run(corpus0)
+
+    val lda2 = new LDA().setK(k)
+        .setOptimizer(new EMLDAOptimizer)
+        .setDocConcentration(topicSmoothing)
+        .setTopicConcentration(termSmoothing)
+        .setMaxIterations(5)
+        .setSeed(12345)
+        .setInitialModel(model0)
+    val corpus2 = sc.parallelize(tinyCorpus.takeRight(3), 2)
+    val model2 = lda2.run(corpus2).asInstanceOf[DistributedLDAModel]
+
+
+    // Check: basic parameters
+    val localModel2 = model2.toLocal
+    assert(model2.k === k)
+    assert(localModel2.k === k)
+    assert(model2.vocabSize === tinyVocabSize)
+    assert(localModel2.vocabSize === tinyVocabSize)
+    assert(model2.topicsMatrix === localModel2.topicsMatrix)
+
+    // Check: topic summaries
+    val topicSummary = model2.describeTopics().map { case (terms, termWeights) =>
+      Vectors.sparse(tinyVocabSize, terms, termWeights)
+    }.sortBy(_.toString)
+    val localTopicSummary = localModel2.describeTopics().map { case (terms, termWeights) =>
+      Vectors.sparse(tinyVocabSize, terms, termWeights)
+    }.sortBy(_.toString)
+    topicSummary.zip(localTopicSummary).foreach { case (topics, topicsLocal) =>
+      assert(topics ~== topicsLocal absTol 0.01)
+    }
+
+    // Check: per-doc topic distributions
+    val topicDistributions = model2.topicDistributions.collect()
+
+    val top2TopicsPerDoc = model2.topTopicsPerDocument(2).map(t => (t._1, (t._2, t._3)))
+    model2.topicDistributions.join(top2TopicsPerDoc).collect().foreach {
+      case (docId, (topicDistribution, (indices, weights))) =>
+        assert(indices.length == 2)
+        assert(weights.length == 2)
+        val bdvTopicDist = topicDistribution.asBreeze
+        val top2Indices = argtopk(bdvTopicDist, 2)
+        assert(top2Indices.toSet === indices.toSet)
+        assert(bdvTopicDist(top2Indices).toArray.toSet === weights.toSet)
+    }
+
+    // Check: topDocumentsPerTopic
+    // Compare it with top documents per topic derived from topicDistributions
+    val topDocsByTopicDistributions = { n: Int =>
+      Range(0, k).map { topic =>
+        val (doc, docWeights) = topicDistributions.sortBy(-_._2(topic)).take(n).unzip
+        (doc.toArray, docWeights.map(_(topic)).toArray)
+      }.toArray
+    }
+
+    // Top 3 documents per topic
+    model2.topDocumentsPerTopic(3).zip(topDocsByTopicDistributions(3)).foreach { case (t1, t2) =>
+      assert(t1._1 === t2._1)
+      assert(t1._2 === t2._2)
+    }
+
+    // All documents per topic
+    val q = tinyCorpus.length
+    model2.topDocumentsPerTopic(q).zip(topDocsByTopicDistributions(q)).foreach { case (t1, t2) =>
+      assert(t1._1 === t2._1)
+      assert(t1._2 === t2._2)
+    }
+
+    // Check: topTopicAssignments
+    // Make sure it assigns a topic to each term appearing in each doc.
+    val topTopicAssignments: Map[Long, (Array[Int], Array[Int])] =
+      model2.topicAssignments.collect().map(x => x._1 -> (x._2, x._3)).toMap
+    assert(topTopicAssignments.keys.max < tinyCorpus.length)
+    tinyCorpus.foreach { case (docID: Long, doc: Vector) =>
+      if (topTopicAssignments.contains(docID)) {
+        val (inds, vals) = topTopicAssignments(docID)
+        assert(inds.length === doc.numNonzeros)
+        // For "term" in actual doc,
+        // check that it has a topic assigned.
+        doc.foreachActive((term, wcnt) => assert(wcnt === 0 || inds.contains(term)))
+      } else {
+        assert(doc.numNonzeros === 0)
+      }
+    }
+  }
+
   test("vertex indexing") {
     // Check vertex ID indexing and conversions.
     val docIds = Array(0, 1, 2)
@@ -200,6 +299,34 @@ class LDASuite extends SparkFunSuite with MLlibTestSparkContext {
       val corpus = sc.parallelize(tinyCorpus, 2)
       lda.run(corpus)
     }
+  }
+
+  test("EMLDAOptimizer initialization with a previous model") {
+    val k = 3
+    val topicSmoothing = 1.2
+    val termSmoothing = 1.2
+
+    // Train a model
+    val lda = new LDA().setK(k)
+        .setOptimizer(new EMLDAOptimizer)
+        .setDocConcentration(topicSmoothing)
+        .setTopicConcentration(termSmoothing)
+    val corpus = sc.parallelize(tinyCorpus, 2)
+    val model: LDAModel = lda.run(corpus)
+
+    val lda2 = new LDA().setK(k)
+        .setOptimizer(new EMLDAOptimizer)
+        .setDocConcentration(topicSmoothing)
+        .setTopicConcentration(termSmoothing)
+        .setMaxIterations(0)
+        .setInitialModel(model)
+    val model2: LDAModel = lda2.run(corpus)
+
+    assert(model2.k === tinyK)
+    assert(model2.vocabSize === model.vocabSize)
+    assert(model2.docConcentration === model.docConcentration)
+    assert(model2.topicConcentration === model.topicConcentration)
+    assert(model2.topicsMatrix === model.topicsMatrix)
   }
 
   test("OnlineLDAOptimizer initialization") {

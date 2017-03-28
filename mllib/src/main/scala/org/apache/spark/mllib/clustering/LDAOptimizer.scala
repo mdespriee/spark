@@ -459,6 +459,8 @@ final class OnlineLDAOptimizer extends LDAOptimizer {
 
     this.docs = docs
 
+    this.docs = docs
+
     this.iteration = 0
     this
   }

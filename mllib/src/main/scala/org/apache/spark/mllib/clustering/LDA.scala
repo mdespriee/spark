@@ -329,13 +329,15 @@ class LDA private (
   @Since("2.2.0")
   def setInitialModel(model: LDAModel): this.type = {
     require(model.k == k, "mismatched number of topics")
-    this.ldaOptimizer match {
-      case _: OnlineLDAOptimizer =>
-        initialModel = Some(model)
-        this
+    (this.ldaOptimizer, model) match {
+      case (o: OnlineLDAOptimizer, m: LocalLDAModel) =>
+        this.initialModel = Some(model)
+      case (o: EMLDAOptimizer, m: DistributedLDAModel) =>
+        this.initialModel = Some(model)
       case _ => throw new IllegalArgumentException(
-        "Only online optimizer supports initialization with a previous model.")
+        "Mismatch between configured optimizer and provided previous model.")
     }
+    this
   }
 
   /**

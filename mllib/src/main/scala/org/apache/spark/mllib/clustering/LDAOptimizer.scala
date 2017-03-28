@@ -123,16 +123,10 @@ final class EMLDAOptimizer extends LDAOptimizer {
       initialModel: Option[LDAModel],
       docs: RDD[(Long, Vector)],
       lda: LDA): EMLDAOptimizer = {
-    if (initialModel.isDefined) {
-      throw new IllegalArgumentException(
-        "initialModel parameter is not supported by EMLDAOptimizer")
-    }
-
     // EMLDAOptimizer currently only supports symmetric document-topic priors
     val docConcentration = lda.getDocConcentration
-
     val topicConcentration = lda.getTopicConcentration
-    val k = lda.getK
+    this.k = lda.getK
 
     // Note: The restriction > 1.0 may be relaxed in the future (allowing sparse solutions),
     // but values in (0,1) are not yet supported.
@@ -141,6 +135,7 @@ final class EMLDAOptimizer extends LDAOptimizer {
     require(topicConcentration > 1.0 || topicConcentration == -1.0, s"LDA topicConcentration " +
       s"must be > 1.0 (or -1 for auto) for EM Optimizer, but was set to $topicConcentration")
 
+    this.vocabSize = docs.take(1).head._2.size
     this.docConcentration = if (docConcentration == -1) (50.0 / k) + 1.0 else docConcentration
     this.topicConcentration = if (topicConcentration == -1) 1.1 else topicConcentration
     val randomSeed = lda.getSeed
@@ -153,6 +148,40 @@ final class EMLDAOptimizer extends LDAOptimizer {
       }
     }
 
+    this.graph = initialModel match {
+      case Some(model: DistributedLDAModel) =>
+        require(model.k == this.k, "mismatched number of topics")
+        require(model.vocabSize == docs.first()._2.size, "mismatched vocabulary size")
+        require(model.docConcentration(0) == this.docConcentration,
+          "mismatched doc concentration")
+        require(model.topicConcentration == this.topicConcentration,
+          "mismatched topic concentration")
+        // Reuse the vertices from provided model
+        // and merge edges (doc->term) with those from model
+        val vertices: VertexRDD[TopicCounts] = model.graph.vertices
+        val edgesUnion: RDD[Edge[TokenCount]] = model.graph.edges.union(edges)
+        Graph(vertices, edgesUnion)
+      case None =>
+        // Create vertices.
+        // Initially, we use random soft assignments of tokens to topics (random gamma).
+        val docTermVertices: RDD[(VertexId, TopicCounts)] =
+          initRandomTermVertices(edges, lda.getK, lda.getSeed)
+        Graph(docTermVertices, edges)
+      case other =>
+        throw new IllegalArgumentException(s"mismatched model types, got $other")
+    }
+
+    // Partition such that edges are grouped by document
+    this.graph = this.graph.partitionBy(PartitionStrategy.EdgePartition1D)
+    this.checkpointInterval = lda.getCheckpointInterval
+    this.graphCheckpointer = new PeriodicGraphCheckpointer[TopicCounts, TokenCount](
+      checkpointInterval, graph.vertices.sparkContext)
+    this.graphCheckpointer.update(this.graph)
+    this.globalTopicTotals = computeGlobalTopicTotals()
+    this
+  }
+
+  private def initRandomTermVertices(edges: RDD[Edge[TokenCount]], k: Int, randomSeed: Long) = {
     // Create vertices.
     // Initially, we use random soft assignments of tokens to topics (random gamma).
     val docTermVertices: RDD[(VertexId, TopicCounts)] = {
@@ -167,17 +196,7 @@ final class EMLDAOptimizer extends LDAOptimizer {
         }
       verticesTMP.reduceByKey(_ + _)
     }
-
-    // Partition such that edges are grouped by document
-    this.graph = Graph(docTermVertices, edges).partitionBy(PartitionStrategy.EdgePartition1D)
-    this.k = k
-    this.vocabSize = docs.take(1).head._2.size
-    this.checkpointInterval = lda.getCheckpointInterval
-    this.graphCheckpointer = new PeriodicGraphCheckpointer[TopicCounts, TokenCount](
-      checkpointInterval, graph.vertices.sparkContext)
-    this.graphCheckpointer.update(this.graph)
-    this.globalTopicTotals = computeGlobalTopicTotals()
-    this
+    docTermVertices
   }
 
   override private[clustering] def next(): EMLDAOptimizer = {
